@@ -132,6 +132,25 @@ class MemoryEstimator:
         kvcache_mem = cls.available_kv_cache_memory(
             model_weights_size, activation_memory_size, model_config, devices
         )
+
+        # If activation estimate makes KV cache memory negative, fall back
+        # to weights-only estimate (same logic as estimate_memory_footprint).
+        if kvcache_mem <= 0:
+            free_memory = cls.free_memory(devices)
+            kvcache_mem_weights_only = int(
+                free_memory
+                * model_config.kv_cache.device_memory_utilization
+                - model_weights_size
+            )
+            if kvcache_mem_weights_only > 0:
+                logger.warning(
+                    "KV cache memory negative with activation estimate; "
+                    "using weights-only estimate for max_seq_len calculation."
+                )
+                kvcache_mem = kvcache_mem_weights_only
+            else:
+                return None
+
         return compute_max_seq_len_fitting_in_cache(
             params=params,
             available_cache_memory=kvcache_mem,
@@ -188,15 +207,26 @@ class MemoryEstimator:
         # Total static memory requirement (weights + activations)
         static_memory_size = model_weights_size + activation_memory_size
 
-        if static_memory_size > free_memory:
-            error_msg = f"Model size exceeds available memory ({to_human_readable_bytes(static_memory_size)} > {to_human_readable_bytes(free_memory)}). "
-            if activation_memory_size > 0:
-                error_msg += (
-                    f"Model weights: {to_human_readable_bytes(model_weights_size)}, "
-                    f"Activation memory: {to_human_readable_bytes(activation_memory_size)}. "
-                )
+        # Hard reject only if weights alone exceed free memory.
+        # Activation estimates can be rough (some models hardcode large
+        # values), so we warn instead of blocking when the total exceeds
+        # free memory but weights alone would fit.
+        if model_weights_size > free_memory:
+            error_msg = f"Model weights exceed available memory ({to_human_readable_bytes(model_weights_size)} > {to_human_readable_bytes(free_memory)}). "
             error_msg += "Try running a smaller model, using a smaller precision, or using a device with more memory."
             raise RuntimeError(error_msg)
+
+        activation_estimate_suspect = False
+        if static_memory_size > free_memory:
+            activation_estimate_suspect = True
+            logger.warning(
+                f"Estimated model weights ({to_human_readable_bytes(model_weights_size)}) + "
+                f"activation memory ({to_human_readable_bytes(activation_memory_size)}) = "
+                f"{to_human_readable_bytes(static_memory_size)} exceeds free memory "
+                f"({to_human_readable_bytes(free_memory)}). "
+                "Activation estimate may be conservative; proceeding with "
+                "actual free memory measurement after weight loading."
+            )
 
         total_size = static_memory_size
         available_kv_cache_memory = int(
@@ -205,11 +235,28 @@ class MemoryEstimator:
         )
 
         if available_kv_cache_memory <= 0:
-            raise RuntimeError(
-                f"The model {to_human_readable_bytes(model_weights_size)} and activations "
-                f"{to_human_readable_bytes(activation_memory_size)} don't leave room for KV cache. "
-                f"Try running a smaller model, using a smaller precision, or using a device with more memory."
+            # If activation estimate pushed us negative, try with weights
+            # only.  The actual free memory will be validated post-weight-load
+            # in load_kv_manager.
+            available_kv_cache_memory_weights_only = int(
+                free_memory * model_config.kv_cache.device_memory_utilization
+                - model_weights_size
             )
+            if available_kv_cache_memory_weights_only > 0:
+                logger.warning(
+                    f"KV cache budget is negative with estimated activations "
+                    f"({to_human_readable_bytes(activation_memory_size)}). "
+                    f"Using weights-only estimate for initial budget "
+                    f"({to_human_readable_bytes(available_kv_cache_memory_weights_only)}). "
+                    f"Actual allocation will be adjusted after weight loading."
+                )
+                available_kv_cache_memory = available_kv_cache_memory_weights_only
+            else:
+                raise RuntimeError(
+                    f"The model {to_human_readable_bytes(model_weights_size)} and activations "
+                    f"{to_human_readable_bytes(activation_memory_size)} don't leave room for KV cache. "
+                    f"Try running a smaller model, using a smaller precision, or using a device with more memory."
+                )
 
         user_provided_max_length = model_config.max_length is not None
         user_provided_max_batch_size = (
@@ -304,16 +351,24 @@ class MemoryEstimator:
 
         if isinstance(free_memory, int | float):
             if int(total_size) > int(free_memory):
-                cls._raise_oom_error(
-                    pipeline_config,
-                    arch_config,
-                    user_provided_max_length,
-                    user_provided_max_batch_size,
-                    total_size,
-                    free_memory,
-                    available_kv_cache_memory,
-                    devices,
-                )
+                if activation_estimate_suspect:
+                    logger.warning(
+                        f"Estimated total ({to_human_readable_bytes(total_size)}) exceeds "
+                        f"free memory ({to_human_readable_bytes(free_memory)}), but activation "
+                        f"estimate is suspect. Proceeding — actual KV cache allocation "
+                        f"will be adjusted post-weight-load."
+                    )
+                else:
+                    cls._raise_oom_error(
+                        pipeline_config,
+                        arch_config,
+                        user_provided_max_length,
+                        user_provided_max_batch_size,
+                        total_size,
+                        free_memory,
+                        available_kv_cache_memory,
+                        devices,
+                    )
 
             elif int(total_size) > int(vram_usage_limit_scale * free_memory):
                 logger.warning(
