@@ -466,6 +466,8 @@ class OverlapTextGenerationPipeline(
                 max_seq_len=self._pipeline_model.max_seq_len,
                 session=session,
                 available_cache_memory=available_cache_memory,
+                devices=self._devices,
+                device_memory_utilization=model_config.kv_cache.device_memory_utilization,
             )
 
         # Load sampler.

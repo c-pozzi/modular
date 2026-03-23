@@ -16,9 +16,10 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, Mock
 
-from max.driver import is_virtual_device_mode
+from max.driver import Device, is_virtual_device_mode
 from max.engine import InferenceSession
 from max.nn.kv_cache import (
     KVCacheParams,
@@ -26,6 +27,7 @@ from max.nn.kv_cache import (
     compute_num_device_blocks,
     compute_num_host_blocks,
 )
+from max.support.human_readable_formatter import to_human_readable_bytes
 
 from .paged_kv_cache import PagedKVCacheManager
 
@@ -62,12 +64,22 @@ def _load_single_kv_manager(
     )
 
 
+def _query_actual_free_memory(devices: list[Device]) -> int | None:
+    """Query actual free memory from devices post-weight-load."""
+    try:
+        return int(sum(d.stats["free_memory"] for d in devices))
+    except Exception:
+        return None
+
+
 def load_kv_manager(
     params: KVCacheParams,
     max_batch_size: int | None,
     max_seq_len: int,
     session: InferenceSession,
     available_cache_memory: int | None,
+    devices: list[Device] | None = None,
+    device_memory_utilization: float = 0.9,
 ) -> PagedKVCacheManager:
     """Loads a single KV cache manager from the given params."""
     # FIXME: This is very very cursed. We can fix this by making `load_kv_manager`
@@ -87,6 +99,29 @@ def load_kv_manager(
 
     if max_batch_size <= 0:
         raise ValueError("max_batch_size must be greater than 0")
+
+    # Re-query actual free memory now that weights are loaded.
+    # Use min(estimated, actual) to avoid over-allocating KV cache.
+    if devices is not None:
+        actual_free = _query_actual_free_memory(devices)
+        if actual_free is not None:
+            actual_available = int(actual_free * device_memory_utilization)
+            if actual_available < available_cache_memory:
+                logger.info(
+                    f"Post-weight-load memory adjustment: estimated KV cache "
+                    f"budget was {to_human_readable_bytes(available_cache_memory)}, "
+                    f"but actual free memory is {to_human_readable_bytes(actual_free)} "
+                    f"(× {device_memory_utilization} utilization = "
+                    f"{to_human_readable_bytes(actual_available)}). "
+                    f"Using actual value."
+                )
+                available_cache_memory = actual_available
+            else:
+                logger.info(
+                    f"Post-weight-load memory check: actual free memory "
+                    f"{to_human_readable_bytes(actual_free)} confirms estimated "
+                    f"KV cache budget of {to_human_readable_bytes(available_cache_memory)}."
+                )
 
     total_num_pages = compute_num_device_blocks(
         params=params,
